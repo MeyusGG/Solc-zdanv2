@@ -2,7 +2,7 @@ import os
 import asyncio
 import time
 import threading
-from typing import Optional, List
+from typing import List, Optional, Dict
 
 import httpx
 from telegram import Bot
@@ -15,16 +15,17 @@ import uvicorn
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = int(os.environ["CHAT_ID"])
 
+MIN_USD = int(os.getenv("MIN_USD", "100"))
+POLL_SEC = int(os.getenv("POLL_SEC", "30"))
+
 RPC_URLS = [
     "https://rpc.solana.com",
     "https://solana-rpc.publicnode.com",
     "https://api.mainnet-beta.solana.com",
 ]
 
-MIN_USD = int(os.getenv("MIN_USD", "100"))
-POLL_SEC = int(os.getenv("POLL_SEC", "30"))
-
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+WSOL_MINT = "So11111111111111111111111111111111111111112"
 
 TOP5 = [
     "GYQwwvyL4UTrjoNChC1KNWpkYWwB1uuc53nUvpQH5gN2",
@@ -94,7 +95,7 @@ rpc = Rpc(RPC_URLS)
 # =========================
 # SOL PRICE
 # =========================
-_sol_cache = {"ts": 0, "price": 0}
+_sol_cache = {"ts": 0, "price": 0.0}
 
 async def sol_price():
     if time.time() - _sol_cache["ts"] < 60:
@@ -109,43 +110,73 @@ async def sol_price():
         return price
 
 # =========================
-# TX ANALYSIS
+# TOKEN METADATA
 # =========================
-def parse_usdc(tx, owner) -> Optional[float]:
+_token_cache: Dict[str, Dict] = {}
+
+async def token_meta(mint: str) -> Dict[str, str]:
+    if mint in _token_cache:
+        return _token_cache[mint]
+
+    # Solana token list (public, hızlı)
+    url = "https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json"
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.get(url)
+        tokens = r.json().get("tokens", [])
+        for t in tokens:
+            if t.get("address") == mint:
+                meta = {"symbol": t.get("symbol"), "name": t.get("name")}
+                _token_cache[mint] = meta
+                return meta
+
+    meta = {"symbol": mint[:4], "name": "Unknown"}
+    _token_cache[mint] = meta
+    return meta
+
+# =========================
+# TX ANALYSIS – REAL TOKEN
+# =========================
+def find_real_token(tx: dict, owner: str) -> Optional[Dict]:
+    """
+    Owner'ın NET token artışını bulur.
+    USDC / WSOL hariç tutulur.
+    """
     try:
         pre = tx["meta"]["preTokenBalances"]
         post = tx["meta"]["postTokenBalances"]
 
-        def get(arr):
-            out = {}
-            for x in arr:
-                if x["mint"] == USDC_MINT and x["owner"] == owner:
-                    amt = x["uiTokenAmount"]["uiAmount"]
-                    out[x["accountIndex"]] = amt or 0
-            return out
+        pre_map = {}
+        for x in pre:
+            if x["owner"] == owner:
+                pre_map[(x["mint"], x["accountIndex"])] = x["uiTokenAmount"]["uiAmount"] or 0
 
-        p0 = get(pre)
-        p1 = get(post)
+        deltas = []
+        for x in post:
+            if x["owner"] != owner:
+                continue
+            mint = x["mint"]
+            if mint in (USDC_MINT, WSOL_MINT):
+                continue
+            post_amt = x["uiTokenAmount"]["uiAmount"] or 0
+            pre_amt = pre_map.get((mint, x["accountIndex"]), 0)
+            delta = post_amt - pre_amt
+            if delta > 0:
+                deltas.append((mint, delta))
 
-        delta = sum(p1.get(i, 0) - p0.get(i, 0) for i in p1)
-        return delta
-    except:
-        return None
+        if not deltas:
+            return None
 
-def parse_sol(tx, owner) -> Optional[float]:
-    try:
-        keys = tx["transaction"]["message"]["accountKeys"]
-        idx = next(i for i,k in enumerate(keys) if (k["pubkey"] if isinstance(k,dict) else k)==owner)
-        pre = tx["meta"]["preBalances"][idx]
-        post = tx["meta"]["postBalances"][idx]
-        return (post - pre) / 1e9
+        # En çok artan token = gerçek alınan
+        mint, amount = max(deltas, key=lambda x: x[1])
+        return {"mint": mint, "amount": amount}
+
     except:
         return None
 
 # =========================
-# CORE LOGIC
+# CORE
 # =========================
-async def handle_tx(owner, sig):
+async def handle_tx(owner: str, sig: str):
     tx = await rpc.call(
         "getTransaction",
         [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
@@ -156,51 +187,48 @@ async def handle_tx(owner, sig):
     ts = tx.get("blockTime")
     t = time.strftime("%d %b %H:%M", time.gmtime(ts)) if ts else "?"
 
-    # USDC varsa direkt $
-    usdc = parse_usdc(tx, owner)
-    if usdc is not None and abs(usdc) >= MIN_USD:
-        if usdc < 0:
-            await send(
-                f"🟢 ALIM (≥${MIN_USD})\n"
-                f"Cüzdan: {short(owner)}\n"
-                f"Aksiyon: USDC → TOKEN\n"
-                f"Tutar: ${abs(usdc):,.0f}\n"
-                f"Zaman: {t} UTC"
-            )
-        else:
-            await send(
-                f"🔴 SATIŞ (≥${MIN_USD})\n"
-                f"Cüzdan: {short(owner)}\n"
-                f"Aksiyon: TOKEN → USDC\n"
-                f"Tutar: ${usdc:,.0f}\n"
-                f"Zaman: {t} UTC"
-            )
+    token = find_real_token(tx, owner)
+    if not token:
         return
 
-    # SOL ile $
-    sol = parse_sol(tx, owner)
-    if sol:
-        price = await sol_price()
-        usd = abs(sol) * price
-        if usd >= MIN_USD:
-            if sol < 0:
-                await send(
-                    f"🟢 ALIM (≥${MIN_USD})\n"
-                    f"Cüzdan: {short(owner)}\n"
-                    f"Aksiyon: SOL → TOKEN\n"
-                    f"Harcama: {abs(sol):.2f} SOL (~${usd:,.0f})\n"
-                    f"Zaman: {t} UTC"
-                )
-            else:
-                await send(
-                    f"🔴 SATIŞ (≥${MIN_USD})\n"
-                    f"Cüzdan: {short(owner)}\n"
-                    f"Aksiyon: TOKEN → SOL\n"
-                    f"Alınan: {sol:.2f} SOL (~${usd:,.0f})\n"
-                    f"Zaman: {t} UTC"
-                )
+    sol_delta = None
+    try:
+        keys = tx["transaction"]["message"]["accountKeys"]
+        idx = next(i for i,k in enumerate(keys) if (k["pubkey"] if isinstance(k,dict) else k)==owner)
+        pre = tx["meta"]["preBalances"][idx]
+        post = tx["meta"]["postBalances"][idx]
+        sol_delta = (post - pre) / 1e9
+    except:
+        pass
 
-async def watch_wallet(owner):
+    price = await sol_price()
+    usd = abs(sol_delta) * price if sol_delta else 0
+
+    if usd < MIN_USD:
+        return
+
+    meta = await token_meta(token["mint"])
+
+    if sol_delta < 0:
+        await send(
+            f"🟢 ALIM (≥${MIN_USD})\n"
+            f"Cüzdan: {short(owner)}\n"
+            f"Token: {meta['symbol']} ({meta['name']})\n"
+            f"Aksiyon: SOL → {meta['symbol']}\n"
+            f"Harcama: {abs(sol_delta):.2f} SOL (~${usd:,.0f})\n"
+            f"Zaman: {t} UTC"
+        )
+    else:
+        await send(
+            f"🔴 SATIŞ (≥${MIN_USD})\n"
+            f"Cüzdan: {short(owner)}\n"
+            f"Token: {meta['symbol']} ({meta['name']})\n"
+            f"Aksiyon: {meta['symbol']} → SOL\n"
+            f"Alınan: {sol_delta:.2f} SOL (~${usd:,.0f})\n"
+            f"Zaman: {t} UTC"
+        )
+
+async def watch_wallet(owner: str):
     seen = set()
     while True:
         try:
@@ -217,7 +245,7 @@ async def watch_wallet(owner):
         await asyncio.sleep(POLL_SEC)
 
 async def main():
-    await send("✅ Top5 Cüzdan Alarm Sistemi AKTİF")
+    await send("✅ Top5 Cüzdan Alarm Sistemi AKTİF (Token isimli)")
     await asyncio.gather(*(watch_wallet(w) for w in TOP5))
 
 # =========================
